@@ -25,8 +25,8 @@ Every release has these files. Pick the one for your computer from the [latest r
 | **Linux** (any distribution, x86-64) | `termonster-VERSION-linux-x86_64.tar.gz` | Unpack it and run `./install.sh`. No root needed; it installs for your user. |
 | Debian, Ubuntu, Mint, Pop!_OS | `termonster_VERSION_amd64.deb` | `sudo apt install ./termonster_VERSION_amd64.deb` |
 | Arch, Manjaro, EndeavourOS | `termonster-VERSION-1-x86_64.pkg.tar.zst` | `sudo pacman -U ./termonster-VERSION-1-x86_64.pkg.tar.zst` |
-| **Windows** 10 / 11 (x64) | `termonster-setup-VERSION.exe` | Run it. Termonster opens and offers to install itself. |
-| **macOS** 11+ (Apple silicon and Intel) | `Termonster-VERSION.dmg` | Open it and drag Termonster to Applications. |
+| **Windows** 10 / 11 (x64) | `termonster-setup-VERSION.exe` | Run the setup wizard: pick *only for me* (no administrator password) or *all users*, the folder and the shortcuts. Termonster then shows in the Start menu and in Settings › Apps. (`termonster-VERSION-windows-portable.exe` runs without installing.) |
+| **macOS** 11+ (Apple silicon and Intel) | `Termonster-VERSION.dmg` | Open it and drag Termonster onto the Applications folder next to it. Opened straight from the disk image, Termonster offers to move itself there. |
 
 The `termonster-<os>-<arch>.gz` files and their `.sha256` checksums are what Termonster's built-in updater downloads. You don't need them for a first install.
 
@@ -113,7 +113,8 @@ Termonster has no telemetry and no analytics. It connects to the internet only w
 
 ## Uninstall
 
-- **Linux and Windows:** run `termonster uninstall`, or use **Settings › Install & open anywhere**. Add `--purge` to remove your settings too. A `.deb` or Arch package is removed with `sudo apt remove termonster` or `sudo pacman -R termonster`.
+- **Windows:** **Settings › Apps › Termonster › Uninstall** (or the Termonster uninstaller in the Start menu search).
+- **Linux:** run `termonster uninstall`, or use **Settings › Install & open anywhere**. Add `--purge` to remove your settings too. A `.deb` or Arch package is removed with `sudo apt remove termonster` or `sudo pacman -R termonster`.
 - **macOS:** run `termonster uninstall`, or drag Termonster from Applications to the Bin.
 
 ## Support
