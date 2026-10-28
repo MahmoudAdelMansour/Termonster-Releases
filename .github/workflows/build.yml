@@ -1,0 +1,266 @@
+# Builds and tests Termonster on GitHub's free runners for public
+# repositories: Linux, Windows and macOS, with the same real install, launch
+# and uninstall checks as the source repository's CI.
+#
+# The source stays private. It is checked out with a read-only deploy key
+# (secret TERMONSTER_SOURCE_KEY) and never committed here. Only people with
+# write access can start this workflow; it doesn't run on pushes or pull
+# requests. Its logs are public.
+name: Build and test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag of MahmoudAdelMansour/termonster to build (a v* tag to release)
+        default: main
+        required: true
+      publish:
+        description: Publish a release from the builds (needs a v* tag)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency: { group: "build-${{ inputs.ref }}", cancel-in-progress: false }
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: MahmoudAdelMansour/termonster, ref: "${{ inputs.ref }}", ssh-key: "${{ secrets.TERMONSTER_SOURCE_KEY }}", fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: System libraries (GTK + WebKit)
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev xvfb desktop-file-utils zstd zsh fish
+      - name: Test and vet
+        run: make test vet
+        env: { TM_REQUIRE_SHELLS: "bash,zsh,fish" }
+      - name: Build downloads
+        run: make dist
+      - name: Install cycle (fresh home)
+        run: |
+          export HOME=$RUNNER_TEMP/home XDG_DATA_HOME=$RUNNER_TEMP/home/.local/share XDG_CONFIG_HOME=$RUNNER_TEMP/home/.config
+          mkdir -p $HOME/Desktop
+          ./bin/termonster install
+          for f in .local/share/termonster/termonster .local/bin/termonster .local/share/applications/termonster.desktop \
+                   .local/share/icons/hicolor/256x256/apps/termonster.png Desktop/termonster.desktop .config/termonster/install.json; do
+            test -e "$HOME/$f" || { echo "missing after install: $f"; exit 1; }
+          done
+          desktop-file-validate $XDG_DATA_HOME/applications/termonster.desktop
+          # The window opens and stays up (killed after 15 s = success).
+          set +e; timeout 15 xvfb-run -a $XDG_DATA_HOME/termonster/termonster; rc=$?; set -e
+          test $rc -eq 124 || { echo "Termonster exited early ($rc)"; exit 1; }
+          $XDG_DATA_HOME/termonster/termonster uninstall
+          for f in .local/share/termonster/termonster .local/bin/termonster .local/share/applications/termonster.desktop Desktop/termonster.desktop; do
+            test ! -e "$HOME/$f" || { echo "left after uninstall: $f"; exit 1; }
+          done
+      - name: Install the .deb
+        run: sudo apt-get install -y ./dist/termonster_*_amd64.deb && test -x /usr/bin/termonster && test -f /usr/share/applications/termonster.desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termonster-linux
+          path: |
+            dist/*.gz
+            dist/*.sha256
+            dist/*.deb
+            dist/*.pkg.tar.zst
+
+  windows:
+    runs-on: windows-latest
+    defaults: { run: { shell: pwsh } }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: MahmoudAdelMansour/termonster, ref: "${{ inputs.ref }}", ssh-key: "${{ secrets.TERMONSTER_SOURCE_KEY }}", fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: Test
+        run: go test ./...
+      - name: PowerShell integration writes its markers before the prompt's own output
+        run: |
+          # conda's prompt prints "(base) " with Write-Host; the markers must come first.
+          $ps1 = Resolve-Path internal/shell/scripts/termonster.ps1
+          foreach ($exe in 'powershell', 'pwsh') {
+            & $exe -NoProfile -NoLogo -Command "function global:prompt { Write-Host -NoNewline '(base) '; 'PS> ' }; . '$ps1'; [Console]::Write((prompt))" > prompt.txt
+            $out = Get-Content prompt.txt -Raw
+            $a = $out.IndexOf(']133;A'); $b = $out.IndexOf('(base)')
+            if ($a -lt 0 -or $b -lt 0 -or $a -gt $b) { throw "${exe}: markers after the prompt's own text: $($out -replace [char]27, '<ESC>' -replace [char]7, '<BEL>')" }
+          }
+      - name: PowerShell workflows parse (Windows PowerShell 5.1 and pwsh)
+        run: |
+          $wf = Get-Content internal/workflows/library.json -Raw | ConvertFrom-Json | Where-Object { $_.shells -contains 'pwsh' }
+          if (-not $wf) { throw 'no PowerShell workflows in the library' }
+          $code = ($wf | ForEach-Object { ($_.command -replace '\{\{\s*([^{}:]+?)\s*(:([^{}]*))?\}\}', 'x1') }) -join "`n"
+          Set-Content wf.ps1 $code
+          foreach ($exe in 'powershell', 'pwsh') {
+            & $exe -NoProfile -Command '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path wf.ps1), [ref]$null, [ref]$e); if ($e) { $e | ForEach-Object { "$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }'
+            if ($LASTEXITCODE) { throw "$exe can't parse a PowerShell workflow" }
+          }
+      - name: Build (icon, version info, manifest)
+        run: |
+          $ver = (git describe --tags 2>$null) -replace '^v','' ; if (-not $ver) { $ver = '0.1.0' }
+          go run ./tools/syso $ver amd64
+          $env:CGO_ENABLED = '0'
+          go build -tags production -ldflags "-s -w -H windowsgui -X termonster/internal/core.Version=$ver" -o dist/termonster.exe ./cmd/termonster
+          "VER=$ver" >> $env:GITHUB_ENV
+      - name: Setup wizard (Inno Setup)
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup isn't available" }
+          go run ./tools/wizimg dist/wiz
+          $p = Start-Process dist/termonster.exe -ArgumentList 'assets','dist/assets' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "assets failed" }
+          Copy-Item dist/assets/termonster.ico dist/wiz/
+          $num = ($env:VER -split '-')[0]
+          & $iscc /Qp "/DAppVer=$env:VER" "/DNumVer=$num" "/DSrc=$PWD\dist\termonster.exe" "/DArt=$PWD\dist\wiz" "/DOut=$PWD\dist" packaging\windows\termonster.iss
+          if ($LASTEXITCODE -ne 0) { throw "the wizard didn't build" }
+          Copy-Item dist/termonster.exe "dist/termonster-$env:VER-windows-portable.exe"
+      - name: Install cycle (setup wizard)
+        timeout-minutes: 10
+        run: |
+          $setup = Resolve-Path "dist/termonster-setup-$env:VER.exe"
+          $p = Start-Process $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/TASKS=desktopicon,path,explorer',"/LOG=$PWD\setup.log" -PassThru
+          if (-not $p.WaitForExit(180000)) { Get-Content setup.log -Tail 60; Get-Process termonster* -EA 0 | Format-Table Id, Path; throw "setup didn't finish in 3 minutes" }
+          if ($p.ExitCode -ne 0) { Get-Content setup.log -Tail 40; throw "setup failed ($($p.ExitCode))" }
+          if (Get-Process termonster -EA 0) { throw "a silent install (without /RELAUNCH) must not start Termonster" }
+          $dir  = "$env:LOCALAPPDATA\Programs\Termonster"
+          $exe  = "$dir\termonster.exe"
+          $menu = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Termonster.lnk"
+          $desk = [Environment]::GetFolderPath('Desktop') + '\Termonster.lnk'
+          foreach ($f in $exe, "$dir\unins000.exe", $menu, $desk) { if (-not (Test-Path $f)) { Get-Content setup.log -Tail 40; throw "missing after setup: $f" } }
+          $sh = New-Object -ComObject WScript.Shell
+          foreach ($l in $menu, $desk) { $t = $sh.CreateShortcut($l).TargetPath; if ($t -ne $exe) { throw "$l points at '$t', not $exe" } }
+          # One Settings > Apps entry: the wizard's (with version and uninstaller).
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{6F1C2A3E-7B4D-4E8A-9C21-5D7E3B9A1F40}_is1'
+          $u = Get-ItemProperty $key
+          if ($u.DisplayName -ne 'Termonster' -or $u.DisplayVersion -ne $env:VER -or -not $u.UninstallString) { throw "Settings > Apps entry is wrong: $($u | Out-String)" }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Termonster') { throw 'a second Settings > Apps entry' }
+          # termonster install --managed ran: Explorer entry and the termonster command.
+          if (-not (Test-Path 'HKCU:\Software\Classes\Directory\shell\Termonster\command')) { throw 'no Explorer entry' }
+          $ap = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\termonster.exe'
+          if ((Get-ItemProperty $ap).'(default)' -ne $exe) { throw "termonster command points elsewhere: $((Get-ItemProperty $ap).'(default)')" }
+          # ...and the folder is in the user's PATH, so terminals find termonster (issue #4).
+          $userPath = (Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+          if (-not (($userPath -split ';') -contains $dir)) { throw "the install folder isn't in the user PATH: $userPath" }
+          # The window (WebView2) starts and keeps running.
+          $app = Start-Process $exe -PassThru
+          Start-Sleep 15
+          if ($app.HasExited) { throw "Termonster quit right away (exit $($app.ExitCode))" }
+          Stop-Process $app.Id -Force
+          Start-Sleep 2
+          $p = Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$PWD\uninstall.log" -PassThru
+          if (-not $p.WaitForExit(180000)) { Get-Content uninstall.log -Tail 60 -EA 0; throw "uninstall didn't finish in 3 minutes" }
+          if ($p.ExitCode -ne 0) { throw "uninstall failed ($($p.ExitCode))" }
+          Start-Sleep 5
+          foreach ($f in $exe, $menu, $desk, $key, $ap, 'HKCU:\Software\Classes\Directory\shell\Termonster') { if (Test-Path $f) { throw "left after uninstall: $f" } }
+          $userPath = (Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+          if (($userPath -split ';') -contains $dir) { throw "the install folder is still in the user PATH after uninstall" }
+      - name: Install cycle (portable .exe installing itself)
+        timeout-minutes: 10
+        run: |
+          $portable = Resolve-Path "dist/termonster-$env:VER-windows-portable.exe"
+          $p = Start-Process $portable -ArgumentList install -Wait -PassThru -NoNewWindow -RedirectStandardOutput out.txt
+          Get-Content out.txt
+          if ($p.ExitCode -ne 0) { throw "install failed ($($p.ExitCode))" }
+          $exe  = "$env:LOCALAPPDATA\Programs\Termonster\termonster.exe"
+          $menu = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Termonster.lnk"
+          $desk = [Environment]::GetFolderPath('Desktop') + '\Termonster.lnk'
+          foreach ($f in $exe, $menu, $desk) { if (-not (Test-Path $f)) { throw "missing after install: $f" } }
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Termonster'
+          if (-not (Get-ItemProperty $key).UninstallString) { throw 'Installed apps entry is wrong' }
+          $p = Start-Process $exe -ArgumentList uninstall -Wait -PassThru -NoNewWindow -RedirectStandardOutput out2.txt
+          Get-Content out2.txt
+          Start-Sleep 10
+          foreach ($f in $exe, $menu, $desk, $key) { if (Test-Path $f) { throw "left after uninstall: $f" } }
+      - uses: actions/upload-artifact@v4
+        with: { name: termonster-windows, path: "dist/termonster-*.exe" }
+      - name: Update downloads
+        run: |
+          # Old self-installs update with the plain .exe; wizard installs with the next wizard.
+          go run ./tools/pack (Resolve-Path "dist/termonster-$env:VER-windows-portable.exe") dist/termonster-windows-amd64.gz
+          New-Item -ItemType Directory -Force dist/up | Out-Null
+          Copy-Item "dist/termonster-setup-$env:VER.exe" dist/up/termonster-windows-amd64-setup.exe -Force
+          $h = (Get-FileHash dist/up/termonster-windows-amd64-setup.exe -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("$PWD\dist\up\termonster-windows-amd64-setup.exe.sha256", "$h  termonster-windows-amd64-setup.exe`n")
+          Move-Item dist/termonster-windows-amd64.gz* dist/up/
+      - uses: actions/upload-artifact@v4
+        with: { name: termonster-windows-update, path: "dist/up/*" }
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: MahmoudAdelMansour/termonster, ref: "${{ inputs.ref }}", ssh-key: "${{ secrets.TERMONSTER_SOURCE_KEY }}", fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: Test and vet
+        run: go test ./... && go vet ./...
+        env: { TM_REQUIRE_SHELLS: "bash,zsh" } # macOS: bash 3.2 and zsh, the default shell
+      - name: Build Termonster.app and .dmg
+        run: |
+          ver=$(git describe --tags 2>/dev/null | sed 's/^v//; s/-/./g'); ver=${ver:-0.1.0}
+          ./packaging/macos/make-app.sh "$ver"
+          plutil -lint dist/Termonster.app/Contents/Info.plist
+          test -f dist/Termonster.app/Contents/Resources/termonster.icns
+          # The disk image shows the app and an Applications shortcut to drag it onto.
+          mnt=$(hdiutil attach -nobrowse -readonly dist/Termonster-*.dmg | awk -F'\t' '/\/Volumes\//{print $NF}')
+          test -d "$mnt/Termonster.app" && test -L "$mnt/Applications" || { ls -la "$mnt"; exit 1; }
+          hdiutil detach "$mnt"
+      - name: Install cycle
+        run: |
+          ./bin/termonster install
+          app=~/Applications/Termonster.app
+          for f in Contents/Info.plist Contents/MacOS/termonster Contents/Resources/termonster.icns; do
+            test -e "$app/$f" || { echo "missing after install: $f"; exit 1; }
+          done
+          plutil -lint "$app/Contents/Info.plist"
+          # The window opens and keeps running.
+          open "$app"; sleep 15
+          pgrep -f "Termonster.app/Contents/MacOS/termonster" || { echo "Termonster isn't running"; exit 1; }
+          pkill -f "Termonster.app/Contents/MacOS/termonster"; sleep 2
+          "$app/Contents/MacOS/termonster" uninstall
+          test ! -e "$app" || { echo "left after uninstall: $app"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with: { name: termonster-macos, path: "dist/*.dmg" }
+      - name: Update downloads (Apple silicon and Intel)
+        run: |
+          ver=$(git describe --tags 2>/dev/null | sed 's/^v//; s/-/./g'); ver=${ver:-0.1.0}
+          go run ./tools/pack bin/termonster dist/termonster-darwin-$(go env GOARCH).gz
+          CGO_ENABLED=1 GOARCH=amd64 go build -tags production -ldflags "-s -w -X termonster/internal/core.Version=$ver" -o bin/termonster-amd64 ./cmd/termonster
+          go run ./tools/pack bin/termonster-amd64 dist/termonster-darwin-amd64.gz
+      - uses: actions/upload-artifact@v4
+        with: { name: termonster-macos-update, path: "dist/*.gz*" }
+
+  # Publish only when asked, for a v* tag, and only after all three passed.
+  publish:
+    if: inputs.publish && startsWith(inputs.ref, 'v')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: MahmoudAdelMansour/termonster, ref: "${{ inputs.ref }}", ssh-key: "${{ secrets.TERMONSTER_SOURCE_KEY }}" }
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - name: Collect and check the files
+        run: |
+          mkdir -p files
+          find artifacts -type f -exec mv {} files/ \;
+          cd files && for s in *.sha256; do sha256sum -c "$s"; done && ls -l
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}
+        run: |
+          notes=docs/releases/$TAG.md
+          [ -f "$notes" ] || { echo "Termonster ${TAG#v}" > /tmp/notes.md; notes=/tmp/notes.md; }
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber files/*
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Termonster ${TAG#v}" --notes-file "$notes" files/*
+          fi
