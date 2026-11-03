@@ -225,6 +225,21 @@ jobs:
           pkill -f "Termonster.app/Contents/MacOS/termonster"; sleep 2
           "$app/Contents/MacOS/termonster" uninstall
           test ! -e "$app" || { echo "left after uninstall: $app"; exit 1; }
+      - name: Opened from the Dock (the bare PATH macOS gives apps)
+        run: |
+          # Claude Code, npm and Homebrew were "not installed" because the app
+          # got /usr/bin:/bin:/usr/sbin:/sbin. It must find what a terminal finds.
+          h=$RUNNER_TEMP/dock; mkdir -p $h/tools/bin
+          printf '#!/bin/sh\necho ok\n' > $h/tools/bin/tm-ci-agent; chmod +x $h/tools/bin/tm-ci-agent
+          printf 'export PATH=$HOME/tools/bin:$PATH\nalias tmcialias=$HOME/.claude/local/claude\n' > $h/.zshrc
+          env -i HOME=$h USER=$USER SHELL=/bin/zsh PATH=/usr/bin:/bin:/usr/sbin:/sbin TERMONSTER_TOKEN=ci TERMONSTER_KEYRING=off \
+            ./bin/termonster serve --port 7799 > $h/serve.log 2>&1 &
+          pid=$!; sleep 6
+          c=$(curl -s -H X-Termonster-Token:ci 127.0.0.1:7799/api/commands)
+          for n in brew tm-ci-agent tmcialias; do echo "$c" | grep -q "\"$n\"" || { echo "not found from the Dock: $n"; cat $h/serve.log; kill $pid; exit 1; }; done
+          s=$(curl -s -H X-Termonster-Token:ci 127.0.0.1:7799/api/store/node)
+          echo "$s" | grep -q '"manager":"brew"' || { echo "Node.js isn't offered with Homebrew: $s"; kill $pid; exit 1; }
+          kill $pid
       - uses: actions/upload-artifact@v4
         with: { name: termonster-macos, path: "dist/*.dmg" }
       - name: Update downloads (Apple silicon and Intel)
