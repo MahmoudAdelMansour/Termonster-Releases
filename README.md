@@ -26,7 +26,8 @@ Every release has these files. Pick the one for your computer from the [latest r
 | Debian, Ubuntu, Mint, Pop!_OS | `termonster_VERSION_amd64.deb` | `sudo apt install ./termonster_VERSION_amd64.deb` |
 | Arch, Manjaro, EndeavourOS | `termonster-VERSION-1-x86_64.pkg.tar.zst` | `sudo pacman -U ./termonster-VERSION-1-x86_64.pkg.tar.zst` |
 | **Windows** 10 / 11 (x64) | `termonster-setup-VERSION.exe` | Run the setup wizard: pick *only for me* (no administrator password) or *all users*, the folder and the shortcuts. Termonster then shows in the Start menu and in Settings › Apps. (`termonster-VERSION-windows-portable.exe` runs without installing.) |
-| **macOS** 11+ (Apple silicon and Intel) | `Termonster-VERSION.dmg` | Open it and drag Termonster onto the Applications folder next to it. Opened straight from the disk image, Termonster offers to move itself there. |
+| **macOS** 11+ (Apple silicon) | `Termonster-VERSION.dmg` | Open it and drag Termonster onto the Applications folder next to it. Opened straight from the disk image, Termonster offers to move itself there. |
+| **macOS** 11+ (Intel) | `termonster-darwin-amd64.gz` | The `.dmg` is Apple silicon only for now. Unpack the file with `gunzip termonster-darwin-amd64.gz`, make it executable with `chmod +x termonster-darwin-amd64`, then run it. |
 
 The `termonster-<os>-<arch>.gz` files and their `.sha256` checksums are what Termonster's built-in updater downloads. You don't need them for a first install.
 
@@ -55,7 +56,8 @@ Every update file comes with a `.sha256`:
 
 ```sh
 sha256sum -c termonster-linux-amd64.gz.sha256      # Linux
-shasum -a 256 -c termonster-darwin-arm64.gz.sha256 # macOS
+shasum -a 256 -c termonster-darwin-arm64.gz.sha256 # macOS (Apple silicon)
+shasum -a 256 -c termonster-darwin-amd64.gz.sha256 # macOS (Intel)
 ```
 
 ---
